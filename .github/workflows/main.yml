@@ -1,20 +1,23 @@
-name: Navi Calendar Bot
+name: Bo3 NaVi Calendar Bot
 
 on:
   schedule:
-    - cron: "0 */6 * * *"  # запуск кожні 6 годин
-  workflow_dispatch:        # запуск вручну
+    - cron: "0 */6 * * *"   # запуск кожні 6 годин
+  workflow_dispatch:         # можливість запускати вручну
 
 jobs:
   run-bot:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
-      - uses: actions/setup-python@v4
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - run: pip install -r requirements.txt
-      - run: python navi_calendar.py
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Run bot
         env:
-          CALENDAR_ID: ${{ secrets.CALENDAR_ID }}
           GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
+          CALENDAR_ID: ${{ secrets.CALENDAR_ID }}
+        run: python bo3_calendar.py
