@@ -11,7 +11,7 @@ from google.oauth2.service_account import Credentials
 
 BO3_URL = "https://bo3.gg/teams/natus-vincere/matches"
 TIMEZONE = "Europe/Kyiv"
-CALENDAR_ID = os.environ.get("CALENDAR_ID", "primary")
+CALENDAR_ID = os.environ.get("CALENDAR_ID", "").strip() or "primary"
 
 
 def parse_upcoming_matches():
