@@ -175,7 +175,14 @@ def main():
         scopes=["https://www.googleapis.com/auth/calendar"]
     )
     service = build("calendar", "v3", credentials=creds, cache_discovery=False)
-
+try:
+    info = service.calendars().get(calendarId=CALENDAR_ID).execute()
+    print(f"[CHECK] Using calendar: {info.get('summary')} (id={info.get('id')})")
+except Exception as e:
+    print(f"[ERROR] Calendar '{CALENDAR_ID}' not accessible. "
+          f"Перевір, що ID без переносів/пробілів і що сервісний акаунт має доступ.")
+    raise
+    
     matches = parse_upcoming_matches()
     print(f"[INFO] Found {len(matches)} upcoming matches.")
     for m in matches:
