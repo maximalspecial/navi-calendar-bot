@@ -11,7 +11,7 @@ from google.oauth2.service_account import Credentials
 
 BO3_URL = "https://bo3.gg/teams/natus-vincere/matches"
 TIMEZONE = "Europe/Kyiv"
-CALENDAR_ID = os.environ.get("CALENDAR_ID", "").strip() or "primary"
+CALENDAR_ID = (os.environ.get("CALENDAR_ID") or "").strip() or "primary"
 
 
 def parse_upcoming_matches():
@@ -24,19 +24,16 @@ def parse_upcoming_matches():
     resp.raise_for_status()
     soup = BeautifulSoup(resp.text, "html.parser")
 
-    # Ряди з майбутніми матчами
     rows = soup.select(".table-row.table-row--upcoming")
     matches = []
 
     for row in rows:
-        # Головний лінк матчу (містить дату і команди)
         a = row.select_one('a.c-global-match-link.table-cell[href]')
         if not a:
             continue
         href = a["href"]
         link = "https://bo3.gg" + href
 
-        # Команди
         teams = [el.get_text(strip=True) for el in row.select(".team-name")]
         if len(teams) >= 2:
             team1, team2 = teams[0], teams[1]
@@ -45,34 +42,28 @@ def parse_upcoming_matches():
         else:
             team1, team2 = "Natus Vincere", "TBD"
 
-        # Формат серії (Bo1/Bo3 тощо)
         bo_el = row.select_one(".bo-type")
         bo = bo_el.get_text(strip=True) if bo_el else ""
 
-        # Турнір (у сусідній комірці таблиці)
         tour_el = row.select_one(".table-cell.tournament .tournament-name")
         tournament = tour_el.get_text(strip=True) if tour_el else ""
 
-        # Час і дата (час у .date .time, дата як "Aug 31" у тому ж .date)
         time_el = row.select_one(".date .time")
         time_text = time_el.get_text(strip=True) if time_el else None
 
         date_el = row.select_one(".date")
-        # у .date і час, і "Aug 31" — приберемо час
         date_text = None
         if date_el:
             raw = date_el.get_text(" ", strip=True)
             if time_text:
-                raw = raw.replace(time_text, "").strip()
-            date_text = raw  # очікуємо "Aug 31" або "August 31"
+                raw = raw.replace(time_text, "").strip()  # залишимо тільки "Aug 31"/"August 31"
+            date_text = raw
 
-        # Рік беремо з URL, якщо в кінці є ...-DD-MM-YYYY
+        # Рік беремо з кінця href, якщо є ...-DD-MM-YYYY
         year_int = None
         m = re.search(r"(\d{2})-(\d{2})-(\d{4})$", href)
         if m:
-            # dd-mm-yyyy
             year_int = int(m.group(3))
-
         if not year_int:
             year_int = datetime.now().year
 
@@ -80,8 +71,6 @@ def parse_upcoming_matches():
             print(f"[WARN] Skip: missing date/time for {team1} vs {team2} @ {link}")
             continue
 
-        # Склеюємо строку дати-часу
-        # приклади що парсяться: "Aug 31 2025 15:30" або "August 31 2025 15:30"
         dt_str = f"{date_text} {year_int} {time_text}"
         start_naive = None
         for fmt in ("%b %d %Y %H:%M", "%B %d %Y %H:%M"):
@@ -166,23 +155,28 @@ def main():
     creds_json = os.environ.get("GOOGLE_CREDENTIALS_JSON")
     if not creds_json:
         raise RuntimeError("GOOGLE_CREDENTIALS_JSON env var is missing. Add it to GitHub Secrets.")
-
-    # Перетворюємо рядок JSON на dict без eval
     info = json.loads(creds_json)
+
+    # Уточнюю логін сервісного акаунта (для підказки, кому давати доступ у Calendar)
+    client_email = info.get("client_email", "UNKNOWN_SERVICE_ACCOUNT")
+    print(f"[CHECK] Service Account: {client_email}")
 
     creds = Credentials.from_service_account_info(
         info,
         scopes=["https://www.googleapis.com/auth/calendar"]
     )
     service = build("calendar", "v3", credentials=creds, cache_discovery=False)
-try:
-    info = service.calendars().get(calendarId=CALENDAR_ID).execute()
-    print(f"[CHECK] Using calendar: {info.get('summary')} (id={info.get('id')})")
-except Exception as e:
-    print(f"[ERROR] Calendar '{CALENDAR_ID}' not accessible. "
-          f"Перевір, що ID без переносів/пробілів і що сервісний акаунт має доступ.")
-    raise
-    
+
+    # Префлайт: перевіримо доступ до календаря до створення подій
+    try:
+        info_cal = service.calendars().get(calendarId=CALENDAR_ID).execute()
+        print(f"[CHECK] Using calendar: {info_cal.get('summary')} (id={info_cal.get('id')})")
+    except Exception as e:
+        print(f"[ERROR] Calendar '{CALENDAR_ID}' not accessible.\n"
+              f"• Перевір, що ID без пробілів/переносів (наприклад, 'primary' або твій email)\n"
+              f"• Поділись своїм календарем на {client_email} з правами 'Make changes to events'")
+        raise
+
     matches = parse_upcoming_matches()
     print(f"[INFO] Found {len(matches)} upcoming matches.")
     for m in matches:
@@ -194,4 +188,3 @@ except Exception as e:
 
 if __name__ == "__main__":
     main()
-
