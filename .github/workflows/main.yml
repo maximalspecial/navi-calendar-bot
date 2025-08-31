@@ -20,4 +20,5 @@ jobs:
         env:
           GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
           CALENDAR_ID: ${{ secrets.CALENDAR_ID }}
+          SCRAPED_TIME_IS_UTC: "true"  
         run: python bo3_calendar.py
