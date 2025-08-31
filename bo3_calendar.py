@@ -16,6 +16,10 @@ BO3_URL = "https://bo3.gg/teams/natus-vincere/matches"
 TIMEZONE = "Europe/Kyiv"
 CALENDAR_ID = (os.environ.get("CALENDAR_ID") or "").strip() or "primary"
 
+# Якщо HTML дає час у UTC (типова ситуація для серверного HTML),
+# конвертуємо його в Europe/Kyiv. За замовчуванням — true.
+SCRAPED_TIME_IS_UTC = (os.environ.get("SCRAPED_TIME_IS_UTC", "true").lower() in ("1", "true", "yes"))
+
 
 def parse_upcoming_matches():
     """
@@ -88,7 +92,7 @@ def parse_upcoming_matches():
             continue
 
         # Склеюємо рядок дати-часу, який парсимо у naive datetime (без tzinfo)
-        # приклади: "Aug 31 2025 15:30" або "August 31 2025 15:30"
+        # приклади: "Aug 31 2025 12:30" або "August 31 2025 12:30"
         dt_str = f"{date_text} {year_int} {time_text}"
         start_naive = None
         for fmt in ("%b %d %Y %H:%M", "%B %d %Y %H:%M"):
@@ -101,15 +105,22 @@ def parse_upcoming_matches():
             print(f"[ERROR] Date parse failed for '{dt_str}' (teams: {team1} vs {team2})")
             continue
 
-        # === ВАЖЛИВО: обробка таймзони ===
-        # Вважаємо, що час на сторінці — локальний для Києва (як ти його бачиш, напр. 15:30).
         tz_local = pytz.timezone(TIMEZONE)
-        start_local = tz_local.localize(start_naive)
+
+        if SCRAPED_TIME_IS_UTC:
+            # Інтерпретуємо розпарсений час як UTC і конвертуємо у Київ
+            start_local = pytz.utc.localize(start_naive).astimezone(tz_local)
+            print(f"[TZ] Interpreted scraped time as UTC → {start_local.isoformat()}")
+        else:
+            # Інтерпретуємо як локальний київський
+            start_local = tz_local.localize(start_naive)
+            print(f"[TZ] Interpreted scraped time as Europe/Kyiv → {start_local.isoformat()}")
+
         end_local = start_local + timedelta(hours=2)
 
         # Для Google Calendar передаємо dateTime БЕЗ офсету, таймзону окремо.
         start_dt_str = start_local.strftime("%Y-%m-%dT%H:%M:%S")
-        end_dt_str = end_local.strftime("%Y-%m-%dT%H:%M:%S")
+        end_dt_str   = end_local.strftime("%Y-%m-%dT%H:%M:%S")
 
         # Заголовок
         summary_main = f"{team1} vs {team2}"
@@ -190,6 +201,7 @@ def main():
 
     client_email = info.get("client_email", "UNKNOWN_SERVICE_ACCOUNT")
     print(f"[CHECK] Service Account: {client_email}")
+    print(f"[CHECK] SCRAPED_TIME_IS_UTC={SCRAPED_TIME_IS_UTC}")
 
     creds = Credentials.from_service_account_info(
         info,
