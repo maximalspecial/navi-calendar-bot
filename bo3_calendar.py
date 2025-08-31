@@ -82,6 +82,23 @@ def parse_upcoming_matches():
         if not start_naive:
             print(f"[ERROR] Date parse failed for '{dt_str}' (teams: {team1} vs {team2})")
             continue
+            
+        # --- TIMEZONE FIX ---
+        # Якщо сайт віддає час у UTC (часто так буває на серверному HTML),
+        # конвертуємо з UTC у київський.
+        tz_local = pytz.timezone(TIMEZONE)
+        scraped_utc_flag = (os.environ.get("SCRAPED_TIME_IS_UTC", "true").lower() in ("1","true","yes"))
+
+        if scraped_utc_flag:
+            # трактуємо розпарсений час як UTC -> конвертуємо у Київ
+            start = pytz.utc.localize(start_naive).astimezone(tz_local)
+            print(f"[TZ] Interpreted scraped time as UTC → {start.isoformat()}")
+        else:
+            # трактуємо як локальний київський
+            start = tz_local.localize(start_naive)
+            print(f"[TZ] Interpreted scraped time as Europe/Kyiv → {start.isoformat()}")
+
+        end = start + timedelta(hours=2)
 
         tz = pytz.timezone(TIMEZONE)
         start = tz.localize(start_naive)
