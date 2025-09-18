@@ -4,3 +4,4 @@ google-auth-httplib2
 beautifulsoup4
 requests
 pytz
+cloudscraper==1.2.71
