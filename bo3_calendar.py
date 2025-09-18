@@ -5,7 +5,7 @@ import time
 import random
 import requests
 from bs4 import BeautifulSoup
-from datetime import datetime, timedelta, date
+from datetime import datetime, timedelta, timezone
 import pytz
 
 from googleapiclient.discovery import build
@@ -13,51 +13,40 @@ from google.oauth2.service_account import Credentials
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-# ===== Config =====
-LP_MATCHES_URL = "https://liquipedia.net/counterstrike/Liquipedia:Matches"
+# ============ CONFIG ============
+HLTV_URL = "https://www.hltv.org/team/4608/natus-vincere#tab-matchesBox"
 TIMEZONE = "Europe/Kyiv"
 CALENDAR_ID = (os.environ.get("CALENDAR_ID") or "").strip() or "primary"
 EVENT_DURATION_HOURS = 2
-LOOKAHEAD_DAYS = int(os.environ.get("LOOKAHEAD_DAYS", "30"))  # щоб не створювати занадто далекі івенти
+LOOKAHEAD_DAYS = int(os.environ.get("LOOKAHEAD_DAYS", "60"))
 STRICT_DUP_CHECK = (os.environ.get("STRICT_DUP_CHECK", "true").lower() in ("1","true","yes"))
-
-UA_POOL = [
-    "navi-calendar-bot/1.0 (+https://github.com/; contact: calendar-bot@navi.example)",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
-]
 
 READ_TIMEOUT = 45
 CONNECT_TIMEOUT = 10
 TOTAL_RETRIES = 5
 BACKOFF_FACTOR = 1.5
-STATUS_FORCELIST = (429,500,502,503,504)
+STATUS_FORCELIST = (429, 500, 502, 503, 504)
+
+UA_POOL = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0 Safari/537.36",
+]
 
 TZ_LOCAL = pytz.timezone(TIMEZONE)
-TZ_ABBR = {
-    "UTC": pytz.utc, "GMT": pytz.utc,
-    "CET": pytz.timezone("CET"), "CEST": pytz.timezone("CET"),
-    "EET": pytz.timezone("EET"), "EEST": pytz.timezone("EET"),
-}
 
-MONTHS = {m.lower(): i for i, m in enumerate([
-    "", "January","February","March","April","May","June",
-    "July","August","September","October","November","December"
-])}
-ABBR = {"Jan":"January","Feb":"February","Mar":"March","Apr":"April","Jun":"June","Jul":"July",
-        "Aug":"August","Sep":"September","Sept":"September","Oct":"October",
-        "Nov":"November","Dec":"December","May":"May"}
-
+# ============ HTTP ============
 def make_session():
     s = requests.Session()
     retry = Retry(
         total=TOTAL_RETRIES, connect=TOTAL_RETRIES, read=TOTAL_RETRIES,
         backoff_factor=BACKOFF_FACTOR, status_forcelist=STATUS_FORCELIST,
-        allowed_methods=frozenset(["GET","HEAD"]),
-        raise_on_status=False, respect_retry_after_header=True
+        allowed_methods=frozenset(["GET", "HEAD"]),
+        raise_on_status=False, respect_retry_after_header=True,
     )
     adapter = HTTPAdapter(max_retries=retry, pool_connections=10, pool_maxsize=20)
-    s.mount("https://", adapter); s.mount("http://", adapter)
+    s.mount("https://", adapter)
+    s.mount("http://", adapter)
     s.headers.update({
         "User-Agent": random.choice(UA_POOL),
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -80,168 +69,95 @@ def fetch_html(url: str) -> str | None:
         print(f"[ERROR] Fetch failed {url}: {e}")
         return None
 
-def _norm_month(name: str) -> str:
-    if not name: return ""
-    cap = name[0].upper() + name[1:].lower()
-    return ABBR.get(cap, cap)
+# ============ HLTV parsing ============
+def _unix_ms_to_kyiv(ms: int) -> datetime:
+    dt_utc = datetime.fromtimestamp(ms / 1000.0, tz=timezone.utc)
+    return dt_utc.astimezone(TZ_LOCAL)
 
-def parse_liquipedia_datetime(label: str) -> datetime | None:
+def _extract_text(el) -> str:
+    return el.get_text(" ", strip=True) if el else ""
+
+def parse_hltv_upcoming():
     """
-    'September 18, 2025 - 18:00 UTC' → aware dt у Europe/Kyiv
-    'Sep 18 - 20:00 CEST' → рік підставимо (поточний або наступний)
+    Парсимо секцію матчів зі сторінки команди HLTV:
+    - шукаємо всі блоки з мітками часу data-unix (мілісекунди)
+    - піднімаємось до контейнера матчу та витягуємо команди, BO, турнір
     """
-    t = " ".join((label or "").split())
-    m = re.search(r'([A-Za-z]{3,9})\s+(\d{1,2})(?:,\s*(\d{4}))?\s*[-–]\s*(\d{1,2}):(\d{2})\s*([A-Za-z]{2,4})', t)
-    if not m:
-        return None
-    mon = _norm_month(m.group(1))
-    day = int(m.group(2))
-    year = int(m.group(3)) if m.group(3) else None
-    hh = int(m.group(4)); mm = int(m.group(5))
-    tzabbr = m.group(6).upper()
-
-    month = MONTHS.get(mon.lower(), 0)
-    if month == 0: return None
-
-    today = datetime.now(TZ_LOCAL).date()
-    if year is None:
-        y = today.year
-        cand = date(y, month, day)
-        if cand < today:
-            y = y + 1
-    else:
-        y = year
-
-    tz_in = TZ_ABBR.get(tzabbr, pytz.utc)
-    try:
-        dt_in = tz_in.localize(datetime(y, month, day, hh, mm))
-    except Exception:
-        return None
-    return dt_in.astimezone(TZ_LOCAL)
-
-def parse_upcoming_from_liquipedia_matches():
-    """
-    Скануємо агрегатор і збираємо лише матчі з участю NAVI/Natus Vincere.
-    """
-    html = fetch_html(LP_MATCHES_URL)
+    html = fetch_html(HLTV_URL)
     if not html:
         return []
 
-    # Пошукаємо всі появи 'NAVI' або 'Natus Vincere' і навколо кожної вікном дістанемо дані
+    soup = BeautifulSoup(html, "html.parser")
+
+    # На HLTV таймери часто у span/div із атрибутом data-unix
+    timers = soup.select("[data-unix]")
+    print(f"[INFO] HLTV timer elements (data-unix) found: {len(timers)}")
+
     matches = []
-    navip = list(re.finditer(r'(?:\bNAVI\b|Natus\s+Vincere)', html, flags=re.I))
-    print(f"[INFO] NAVI mentions on page: {len(navip)}")
+    now_local = datetime.now(TZ_LOCAL)
+    horizon = now_local + timedelta(days=LOOKAHEAD_DAYS)
 
-    for i, m in enumerate(navip, start=1):
-        start = max(0, m.start() - 800)
-        end = min(len(html), m.end() + 1200)
-        chunk = html[start:end]
-
-        # Команди: в обидва боки — 'NAVI ... vs Opp' або 'Opp vs NAVI ...'
-        m_vs = (re.search(r'([A-Za-z0-9\'\-\.\s]{2,40})\s+vs\s+([A-Za-z0-9\'\-\.\s]{2,40})', chunk, flags=re.I) or
-                re.search(r'([A-Za-z0-9\'\-\.\s]{2,40})\s+vs\s+([A-Za-z0-9\'\-\.\s]{2,40})', chunk[::-1], flags=re.I))
-        if not m_vs:
+    for idx, timer in enumerate(timers, start=1):
+        unix_raw = timer.get("data-unix")
+        if not unix_raw or not unix_raw.isdigit():
             continue
-        # беремо з прямого пошуку (розворот використовувався як запасний)
-        m_vs = re.search(r'([A-Za-z0-9\'\-\.\s]{2,40})\s+vs\s+([A-Za-z0-9\'\-\.\s]{2,40})', chunk, flags=re.I)
-        team1, team2 = m_vs.group(1).strip(), m_vs.group(2).strip()
+        start_local = _unix_ms_to_kyiv(int(unix_raw))
 
-        # Переконаємось, що одна з команд — NAVI/Natus Vincere
-        if not (re.search(r'(?:\bNAVI\b|Natus\s+Vincere)', team1, flags=re.I) or
-                re.search(r'(?:\bNAVI\b|Natus\s+Vincere)', team2, flags=re.I)):
-            # іноді 'NAVI' стоїть не в самих назвах команд, а поруч у HTML — тоді форсуємо
-            if re.search(r'(?:\bNAVI\b|Natus\s+Vincere)', chunk, flags=re.I):
-                if "Natus Vincere" not in (team1 + team2):
-                    if re.search(r'(?:\bNAVI\b|Natus\s+Vincere)', team1, flags=re.I):
-                        pass
-                    elif re.search(r'(?:\bNAVI\b|Natus\s+Vincere)', team2, flags=re.I):
-                        pass
-                    else:
-                        # якщо все ж ні — підставимо NAVI як одну з команд
-                        if "Natus Vincere" not in team1 and "NAVI" not in team1.upper():
-                            team1 = "Natus Vincere"
-            else:
-                continue
-
-        # Формат: (Bo3) поруч
-        mbo = re.search(r'\(Bo(\d)\)', chunk, flags=re.I)
-        bo = f"Bo{mbo.group(1)}" if mbo else ""
-
-        # Дата/час: найближчий шаблон 'Month D[, YYYY] - HH:MM TZ'
-        m_dt = re.search(r'([A-Za-z]{3,9}\s+\d{1,2}(?:,\s*\d{4})?\s*[-–]\s*\d{1,2}:\d{2}\s*[A-Za-z]{2,4})', chunk)
-        if not m_dt:
+        # фільтр часу
+        if start_local < now_local - timedelta(hours=3):
             continue
-        dt_local = parse_liquipedia_datetime(m_dt.group(1))
-        if not dt_local:
+        if start_local > horizon:
             continue
 
-        # Фільтр за горизонтом
-        now_local = datetime.now(TZ_LOCAL)
-        if dt_local < now_local - timedelta(hours=3):
+        # піднімемось угору у пошуках контейнера матчу (5 рівнів достатньо)
+        node = timer
+        container = None
+        for _ in range(6):
+            if node is None:
+                break
+            # у контейнері зазвичай є лінк на /matches/.. і блоки з назвами команд/івенту
+            if node.select_one('a[href^="/matches/"]'):
+                container = node
+                break
+            node = node.parent
+        if container is None:
             continue
-        if dt_local > now_local + timedelta(days=LOOKAHEAD_DAYS):
+
+        # команди: на HLTV часто .team, .opponent, .text-ellipsis тощо
+        team_names = [ _extract_text(t) for t in container.select(".team, .opponent, .text-ellipsis") ]
+        # відсіяти сміття, залишити короткі назви команд
+        team_names = [t for t in (n.strip() for n in team_names) if 1 <= len(t) <= 40]
+        # інколи в контейнері багато елементів — спробуємо знайти дві різні назви
+        team1, team2 = None, None
+        seen = []
+        for t in team_names:
+            if t and t not in seen:
+                seen.append(t)
+        if len(seen) >= 2:
+            team1, team2 = seen[0], seen[1]
+        else:
+            # fallback: regex по тексту
+            raw = container.get_text(" ", strip=True)
+            m_vs = re.search(r'([A-Za-z0-9\'\-\.\s]{2,40})\s+vs\s+([A-Za-z0-9\'\-\.\s]{2,40})', raw, flags=re.I)
+            if m_vs:
+                team1, team2 = m_vs.group(1).strip(), m_vs.group(2).strip()
+        if not (team1 and team2):
             continue
 
-        end_local = dt_local + timedelta(hours=EVENT_DURATION_HOURS)
-        summary = f"{team1} vs {team2}" + (f" ({bo})" if bo else "")
-        matches.append({
-            "summary": summary,
-            "start_dt_str": dt_local.strftime("%Y-%m-%dT%H:%M:%S"),
-            "end_dt_str": end_local.strftime("%Y-%m-%dT%H:%M:%S"),
-            "link": LP_MATCHES_URL,
-        })
-        print(f"[OK] Found: {summary} @ {dt_local.isoformat()} ({TIMEZONE})")
-
-    print(f"[INFO] Total NAVI matches parsed: {len(matches)}")
-    return matches
-
-def has_duplicate_event(service, calendar_id, start_dt, summary):
-    time_min = (start_dt - timedelta(hours=3)).isoformat()
-    time_max = (start_dt + timedelta(hours=3)).isoformat()
-    items = service.events().list(
-        calendarId=calendar_id, timeMin=time_min, timeMax=time_max,
-        singleEvents=True, orderBy="startTime", q=" vs ".join(summary.split(" vs ")[:2])
-    ).execute().get("items", [])
-    for ev in items:
-        if ev.get("summary","").startswith(" vs ".join(summary.split(" vs ")[:2])):
-            print(f"[SKIP] Duplicate near: {ev.get('summary')} at {ev.get('start',{}).get('dateTime')}")
-            return True
-    return False
-
-def create_events(service, matches):
-    created = 0
-    for m in matches:
-        start_dt = TZ_LOCAL.localize(datetime.strptime(m["start_dt_str"], "%Y-%m-%dT%H:%M:%S"))
-        if STRICT_DUP_CHECK and has_duplicate_event(service, CALENDAR_ID, start_dt, m["summary"]):
+        # фільтруємо лише матчі з участю NAVI
+        if "navi" not in (team1 + team2).lower() and "natus vincere" not in (team1 + team2).lower():
             continue
-        event = {
-            "summary": m["summary"],
-            "description": f"Auto-added from {LP_MATCHES_URL}",
-            "start": {"dateTime": m["start_dt_str"], "timeZone": TIMEZONE},
-            "end":   {"dateTime": m["end_dt_str"],   "timeZone": TIMEZONE},
-        }
-        print("[DEBUG] Prepared event:", event)
-        res = service.events().insert(calendarId=CALENDAR_ID, body=event).execute()
-        print(f"[CREATED] {m['summary']} → {res.get('htmlLink','')}")
-        created += 1
-    return created
 
-def main():
-    creds_json = os.environ.get("GOOGLE_CREDENTIALS_JSON")
-    if not creds_json:
-        raise RuntimeError("GOOGLE_CREDENTIALS_JSON env var is missing.")
-    creds = Credentials.from_service_account_info(json.loads(creds_json),
-        scopes=["https://www.googleapis.com/auth/calendar"])
-    service = build("calendar", "v3", credentials=creds, cache_discovery=False)
+        # формат: шукаємо "bo3"/"Best of 3" поруч
+        bo = ""
+        raw_cont = container.get_text(" ", strip=True)
+        m_bo = re.search(r'\b(?:bo\s*?(\d)|best\s*of\s*(\d))\b', raw_cont, flags=re.I)
+        if m_bo:
+            bo_num = m_bo.group(1) or m_bo.group(2)
+            bo = f"Bo{bo_num}"
 
-    print(f"[CHECK] Source: Liquipedia:Matches; TZ={TIMEZONE}")
-    matches = parse_upcoming_from_liquipedia_matches()
-    if not matches:
-        print("[WARN] No NAVI matches parsed from Liquipedia:Matches.")
-        return
+        # турнір: часто є лінк із класами event-name / a[href^="/events/"]
+        event_el = container.select_one('.event-name, a[href^="/events/"]')
+        tournament = _extract_text(event_el)
 
-    created = create_events(service, matches)
-    print(f"[DONE] Created {created} events.")
-
-if __name__ == "__main__":
-    main()
+        end_local = start_local + timedelt
