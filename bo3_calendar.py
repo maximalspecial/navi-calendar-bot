@@ -24,8 +24,8 @@ CALENDAR_ID = (os.environ.get("CALENDAR_ID") or "").strip() or "primary"
 SCRAPED_TIME_IS_UTC = (os.environ.get("SCRAPED_TIME_IS_UTC", "true").lower() in ("1", "true", "yes"))
 
 # HTTP налаштування
-READ_TIMEOUT = 45     # секунд
-CONNECT_TIMEOUT = 10  # секунд
+READ_TIMEOUT = 45
+CONNECT_TIMEOUT = 10
 TOTAL_RETRIES = 5
 BACKOFF_FACTOR = 1.5
 STATUS_FORCELIST = (429, 500, 502, 503, 504)
@@ -36,9 +36,10 @@ UA_POOL = [
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0 Safari/537.36",
 ]
 
+TODAY_ALIASES = {"today", "сьогодні", "сегодня"}
+TOMORROW_ALIASES = {"tomorrow", "завтра"}
 
 def make_session():
-    """HTTP сесія з ретраями і бекофом."""
     s = requests.Session()
     retry = Retry(
         total=TOTAL_RETRIES,
@@ -61,37 +62,53 @@ def make_session():
     })
     return s
 
-
 def fetch_html(url: str) -> str | None:
-    """Завантажити HTML з ретраями. Повертає text або None (без виключень)."""
     sess = make_session()
-    # Невелика випадкова пауза (трохи схоже на користувача)
     time.sleep(random.uniform(0.3, 1.2))
     try:
         resp = sess.get(url, timeout=(CONNECT_TIMEOUT, READ_TIMEOUT))
         if resp.status_code != 200:
             print(f"[WARN] HTTP {resp.status_code} for {url}")
             return None
-        # іноді корисно глянути розмір
         print(f"[INFO] Fetched {url} ({len(resp.text)} bytes)")
         return resp.text
     except requests.exceptions.RequestException as e:
         print(f"[ERROR] Fetch failed for {url}: {e}")
         return None
 
+def _parse_date_text_to_date(date_text: str, year_hint: int) -> tuple[int,int,int]:
+    """
+    Приймає 'Aug 31' / 'August 31' / 'Today' / 'Сьогодні' / 'Tomorrow' / 'Завтра'
+    Повертає (year, month, day) у Києві.
+    """
+    tz_local = pytz.timezone(TIMEZONE)
+    now_local = datetime.now(tz_local).date()
+    lower = date_text.strip().lower()
+
+    if lower in TODAY_ALIASES:
+        d = now_local
+        return (d.year, d.month, d.day)
+    if lower in TOMORROW_ALIASES:
+        d = now_local + timedelta(days=1)
+        return (d.year, d.month, d.day)
+
+    # спробуємо англ. назви місяців
+    for fmt in ("%b %d", "%B %d"):
+        try:
+            tmp = datetime.strptime(date_text.strip(), fmt)
+            # tmp має 1900-й рік -> замінюємо на підказаний
+            return (year_hint, tmp.month, tmp.day)
+        except ValueError:
+            continue
+
+    # fallback: повернемо сьогодні
+    print(f"[WARN] Could not parse date label '{date_text}', fallback to today.")
+    return (now_local.year, now_local.month, now_local.day)
 
 def parse_upcoming_matches():
     """
-    Парсить майбутні матчі NaVi з bo3.gg.
-    Повертає список словників:
-      {
-        summary: "...",
-        start_dt_str: "YYYY-MM-DDTHH:MM:SS",   # без офсету
-        end_dt_str:   "YYYY-MM-DDTHH:MM:SS",   # без офсету
-        link: "...",
-        tournament: "...",
-        bo: "Bo3"/"Bo1"/...
-      }
+    Парсить майбутні/поточні матчі NaVi з bo3.gg.
+    Повертає список словників зі строковими dateTime без офсету.
     """
     html = fetch_html(BO3_URL)
     if not html:
@@ -99,25 +116,37 @@ def parse_upcoming_matches():
         return []
 
     soup = BeautifulSoup(html, "html.parser")
-    rows = soup.select(".table-row.table-row--upcoming")
-    matches = []
 
-    for row in rows:
-        # Посилання на матч
+    # Візьмемо не лише upcoming, а й live/ongoing/today/featured
+    rows = soup.select(
+        ".table-row.table-row--upcoming, "
+        ".table-row.table-row--live, "
+        ".table-row.table-row--ongoing, "
+        ".table-row.table-row--today, "
+        ".table-row.table-row--featured"
+    )
+    print(f"[INFO] Rows matched: {len(rows)}")
+
+    matches = []
+    tz_local = pytz.timezone(TIMEZONE)
+
+    for idx, row in enumerate(rows, start=1):
+        row_classes = row.get("class", [])
         a = row.select_one('a.c-global-match-link.table-cell[href]')
         if not a:
+            print(f"[DEBUG] Row {idx}: no main link; classes={row_classes}")
             continue
+
         href = a["href"]
         link = "https://bo3.gg" + href
 
         # Команди
         teams = [el.get_text(strip=True) for el in row.select(".team-name")]
+        team1, team2 = "Natus Vincere", "TBD"
         if len(teams) >= 2:
             team1, team2 = teams[0], teams[1]
         elif len(teams) == 1:
-            team1, team2 = teams[0], "TBD"
-        else:
-            team1, team2 = "Natus Vincere", "TBD"
+            team1 = teams[0]
 
         # Формат серії
         bo_el = row.select_one(".bo-type")
@@ -127,7 +156,7 @@ def parse_upcoming_matches():
         tour_el = row.select_one(".table-cell.tournament .tournament-name")
         tournament = tour_el.get_text(strip=True) if tour_el else ""
 
-        # Час і дата
+        # Час і дата (raw для дебагу)
         time_el = row.select_one(".date .time")
         time_text = time_el.get_text(strip=True) if time_el else None
 
@@ -136,50 +165,52 @@ def parse_upcoming_matches():
         if date_el:
             raw = date_el.get_text(" ", strip=True)
             if time_text:
-                raw = raw.replace(time_text, "").strip()  # "Aug 31" / "August 31"
+                raw = raw.replace(time_text, "").strip()
             date_text = raw
 
-        # Рік із URL типу ...-DD-MM-YYYY (в кінці)
+        # Рік із URL типу ...-DD-MM-YYYY
         year_int = None
         m = re.search(r"(\d{2})-(\d{2})-(\d{4})$", href)
         if m:
             year_int = int(m.group(3))
         if not year_int:
-            year_int = datetime.now().year
+            # Якщо місяць у підписі вже пройшов і ми наприкінці року — можна доробити логику на +1 рік,
+            # але базово лишаємо поточний.
+            year_int = datetime.now(tz_local).year
+
+        print(f"[DEBUG] Row {idx}: classes={row_classes}, href={href}, date_text={date_text}, time_text={time_text}, year={year_int}")
 
         if not (date_text and time_text):
-            print(f"[WARN] Skip: missing date/time for {team1} vs {team2} @ {link}")
+            print(f"[WARN] Row {idx}: missing date/time for {team1} vs {team2} @ {link}")
             continue
 
-        # Парсимо "Aug 31 2025 12:30"
-        dt_str = f"{date_text} {year_int} {time_text}"
-        start_naive = None
-        for fmt in ("%b %d %Y %H:%M", "%B %d %Y %H:%M"):
-            try:
-                start_naive = datetime.strptime(dt_str, fmt)
-                break
-            except ValueError:
-                continue
-        if not start_naive:
-            print(f"[ERROR] Date parse failed for '{dt_str}' (teams: {team1} vs {team2})")
+        # Розкладаємо date_text у (y,m,d), підтримуючи Today/Tomorrow/локалізовані варіанти
+        y, m, d = _parse_date_text_to_date(date_text, year_int)
+
+        # Будуємо naive datetime з розпаршеного часу (наприклад, '12:30')
+        try:
+            hh, mm = time_text.split(":")
+            start_naive = datetime(y, m, d, int(hh), int(mm))
+        except Exception as e:
+            print(f"[ERROR] Row {idx}: time parse failed '{time_text}' → {e}")
             continue
 
-        tz_local = pytz.timezone(TIMEZONE)
+        # Конвертація часових поясів
         if SCRAPED_TIME_IS_UTC:
-            # HTML час інтерпретуємо як UTC і конвертуємо в Київ
+            # інтерпретуємо як UTC і переводимо у Київ
             start_local = pytz.utc.localize(start_naive).astimezone(tz_local)
-            print(f"[TZ] Interpreted scraped time as UTC → {start_local.isoformat()}")
+            print(f"[TZ] Row {idx}: UTC→Kyiv {start_local.isoformat()}")
         else:
-            # Трактуємо як локальний київський
             start_local = tz_local.localize(start_naive)
-            print(f"[TZ] Interpreted scraped time as Europe/Kyiv → {start_local.isoformat()}")
+            print(f"[TZ] Row {idx}: as Kyiv {start_local.isoformat()}")
 
         end_local = start_local + timedelta(hours=2)
 
-        # Для Google Calendar передаємо dateTime БЕЗ офсету, таймзону okремо.
+        # Для Google Calendar передаємо dateTime БЕЗ офсету
         start_dt_str = start_local.strftime("%Y-%m-%dT%H:%M:%S")
         end_dt_str = end_local.strftime("%Y-%m-%dT%H:%M:%S")
 
+        # Заголовок
         summary_main = f"{team1} vs {team2}"
         if bo:
             summary_main += f" ({bo})"
@@ -195,7 +226,6 @@ def parse_upcoming_matches():
         })
 
     return matches
-
 
 def has_duplicate_event(service, calendar_id, start_dt, summary):
     """Перевірка на дублі в інтервалі [-1h, +3h] від старту."""
@@ -218,13 +248,11 @@ def has_duplicate_event(service, calendar_id, start_dt, summary):
             return True
     return False
 
-
 def create_events(service, matches):
     created = 0
     tz_local = pytz.timezone(TIMEZONE)
 
     for m in matches:
-        # Для пошуку дублів потрібен aware-datetime
         start_dt = datetime.strptime(m["start_dt_str"], "%Y-%m-%dT%H:%M:%S")
         start_dt = tz_local.localize(start_dt)
 
@@ -245,7 +273,6 @@ def create_events(service, matches):
         created += 1
 
     return created
-
 
 def main():
     # Авторизація
@@ -272,25 +299,20 @@ def main():
         print(f"[ERROR] Calendar '{CALENDAR_ID}' not accessible.\n"
               f"• Перевір, що ID без пробілів/переносів (наприклад, 'primary' або точний ID з налаштувань)\n"
               f"• Поділись календарем із {client_email} з правами 'Make changes to events'")
-        # Не продовжуємо, бо немає сенсу
         return
 
-    # Парсимо матчі
     matches = parse_upcoming_matches()
-    print(f"[INFO] Found {len(matches)} upcoming matches.")
+    print(f"[INFO] Found {len(matches)} rows after parse.")
 
-    # Якщо не змогли отримати HTML або матчі — не валимо пайплайн
     if not matches:
-        print("[WARN] No matches parsed (network issue or schedule empty). Skipping this run gracefully.")
+        print("[WARN] No matches parsed (maybe label 'Today'/'Tomorrow', live-only rows, or network).")
         return
 
     for m in matches:
-        print(f"  - {m['summary']} @ {m['start_dt_str']} ({TIMEZONE})")
+        print(f"  - {m['summary']} @ {m['start_dt_str']} ({TIMEZONE}) → {m['link']}")
 
-    # Створюємо події
     created = create_events(service, matches)
     print(f"[DONE] Created {created} events.")
-
 
 if __name__ == "__main__":
     main()
