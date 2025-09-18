@@ -1,236 +1,171 @@
-import os, re, json, time, random
-from datetime import datetime, timedelta, timezone
+import os, re, json, time
+from datetime import datetime, timedelta, date
 import pytz
-import requests
-import cloudscraper
-from bs4 import BeautifulSoup
 
 from googleapiclient.discovery import build
 from google.oauth2.service_account import Credentials
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
+from playwright.sync_api import sync_playwright
 
-# ================== CONFIG ==================
+# ========== CONFIG ==========
+BO3_URL = "https://bo3.gg/teams/natus-vincere/matches"
 TIMEZONE = "Europe/Kyiv"
 CALENDAR_ID = (os.environ.get("CALENDAR_ID") or "").strip() or "primary"
 EVENT_DURATION_HOURS = 2
-LOOKAHEAD_DAYS = int(os.environ.get("LOOKAHEAD_DAYS", "60"))
-STRICT_DUP_CHECK = (os.environ.get("STRICT_DUP_CHECK", "true").lower() in ("1","true","yes"))
 
-HLTV_DESKTOP = "https://www.hltv.org/matches"
-HLTV_MOBILE  = "https://m.hltv.org/matches"
-TEAM_PATTERNS = (r"Natus\s+Vincere", r"\bNAVI\b")
+# Якщо час на сторінці показується у ЛОКАЛЬНІЙ зоні браузера (так і є),
+# ми ставимо контексту таймзону Europe/Kyiv і парсимо як локальний.
+SCRAPED_TIME_IS_LOCAL = True
 
-UA_POOL = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0 Safari/537.36",
-]
-READ_TIMEOUT = 45
-CONNECT_TIMEOUT = 15
-TOTAL_RETRIES = 4
-BACKOFF_FACTOR = 1.5
-STATUS_FORCELIST = (429,500,502,503,504)
+MONTHS = {
+    "jan":1,"feb":2,"mar":3,"apr":4,"may":5,"jun":6,
+    "jul":7,"aug":8,"sep":9,"sept":9,"oct":10,"nov":11,"dec":12,
+    "january":1,"february":2,"march":3,"april":4,"june":6,"july":7,"august":8,
+    "september":9,"october":10,"november":11,"december":12
+}
 
 TZ_LOCAL = pytz.timezone(TIMEZONE)
 
-# ================== HTTP ==================
-def make_retrying_session():
-    s = requests.Session()
-    retry = Retry(
-        total=TOTAL_RETRIES, connect=TOTAL_RETRIES, read=TOTAL_RETRIES,
-        backoff_factor=BACKOFF_FACTOR, status_forcelist=STATUS_FORCELIST,
-        allowed_methods=frozenset(["GET","HEAD"]),
-        raise_on_status=False, respect_retry_after_header=True,
-    )
-    adapter = HTTPAdapter(max_retries=retry, pool_connections=10, pool_maxsize=20)
-    s.mount("https://", adapter); s.mount("http://", adapter)
-    s.headers.update({
-        "User-Agent": random.choice(UA_POOL),
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9,uk;q=0.8,ru;q=0.7",
-        "Connection": "close",
-    })
-    return s
+def _infer_year_from_href(href: str, month: int, day: int) -> int:
+    m = re.search(r"(\d{2})-(\d{2})-(\d{4})$", href or "")
+    if m:
+        return int(m.group(3))
+    today = datetime.now(TZ_LOCAL).date()
+    cand = date(today.year, month, day)
+    return today.year if cand >= today else today.year + 1
 
-def fetch_html(url: str) -> str | None:
+def _norm_month_day(text: str):
+    if not text: return None
+    t = re.sub(r"\s+", " ", text.replace(".", " ")).strip()
+    # очікуємо "Sep 18" або "September 18"
+    m = re.match(r"([A-Za-z]+)\s+(\d{1,2})", t)
+    if not m: return None
+    mon = m.group(1).lower()
+    day = int(m.group(2))
+    if mon not in MONTHS: return None
+    return MONTHS[mon], day
+
+def scrape_matches():
     """
-    Спершу пробуємо через cloudscraper (Cloudflare bypass),
-    якщо не вдалось — звичайний requests з ретраями.
+    Відкриваємо сторінку в Chromium (headless), чекаємо поки намалюється таблиця,
+    і дістаємо дані з DOM (без обходу на матч, бо час є у рядку).
     """
-    # 1) cloudscraper
-    try:
-        scraper = cloudscraper.create_scraper(
-            browser={"browser": "chrome", "platform": "windows", "mobile": False}
+    out = []
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch(headless=True)
+        context = browser.new_context(
+            locale="en-US",
+            timezone_id=TIMEZONE,  # критично: щоб .time на сайті вже був у Києві
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0 Safari/537.36",
+            viewport={"width": 1366, "height": 900},
         )
-        scraper.headers.update({
-            "User-Agent": random.choice(UA_POOL),
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.9,uk;q=0.8,ru;q=0.7",
-        })
-        time.sleep(random.uniform(0.6, 1.4))
-        r = scraper.get(url, timeout=(CONNECT_TIMEOUT, READ_TIMEOUT))
-        if r.status_code == 200 and r.text and not re.search(r"Attention Required|cloudflare|cf-browser-verification", r.text, re.I):
-            print(f"[INFO] Fetched via cloudscraper {url} ({len(r.text)} bytes)")
-            return r.text
-        else:
-            print(f"[WARN] cloudscraper got HTTP {r.status_code} or challenge page for {url}")
-    except Exception as e:
-        print(f"[WARN] cloudscraper failed for {url}: {e}")
+        page = context.new_page()
+        page.set_default_timeout(30000)
 
-    # 2) fallback: requests + retries
-    sess = make_retrying_session()
-    try:
-        time.sleep(random.uniform(0.4, 1.0))
-        r2 = sess.get(url, timeout=(CONNECT_TIMEOUT, READ_TIMEOUT))
-        if r2.status_code == 200:
-            print(f"[INFO] Fetched via requests {url} ({len(r2.text)} bytes)")
-            return r2.text
-        else:
-            print(f"[WARN] HTTP {r2.status_code} for {url}")
-            return None
-    except requests.RequestException as e:
-        print(f"[ERROR] Fetch failed {url}: {e}")
-        return None
+        page.goto(BO3_URL, wait_until="domcontentloaded")
+        # Дочекаємося появи будь-яких рядків (сайт іноді підвантажує частинами)
+        page.wait_for_timeout(1500)
+        # Якщо таблиця не з’явилась відразу — спробуємо почекати рендер
+        for _ in range(5):
+            if page.locator(".table-row").count() > 0:
+                break
+            page.wait_for_timeout(800)
 
-# ================== PARSERS ==================
-def unix_ms_to_kyiv(ms: int) -> datetime:
-    return datetime.fromtimestamp(ms/1000.0, tz=timezone.utc).astimezone(TZ_LOCAL)
+        rows = page.locator(".table-row")
+        count = rows.count()
+        print(f"[INFO] Rendered rows: {count}")
 
-def parse_time_str_to_section_date(time_str: str, section_date: datetime | None) -> datetime | None:
-    m = re.match(r"^\s*(\d{1,2}):(\d{2})\s*$", time_str or "")
-    if not m:
-        return None
-    hh, mm = int(m.group(1)), int(m.group(2))
-    base = section_date or TZ_LOCAL.localize(datetime.now(TZ_LOCAL).replace(hour=0, minute=0, second=0, microsecond=0))
-    try:
-        return TZ_LOCAL.localize(datetime(base.year, base.month, base.day, hh, mm))
-    except Exception:
-        return None
+        for i in range(count):
+            row = rows.nth(i)
 
-def extract_section_date(text: str) -> datetime | None:
-    t = " ".join((text or "").split())
-    m = re.search(r'(\d{4})-(\d{2})-(\d{2})', t)
-    if m:
-        y, mo, d = map(int, m.groups())
-        try: return TZ_LOCAL.localize(datetime(y, mo, d, 0, 0))
-        except Exception: return None
-    m = re.search(r'(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{1,2})(?:,\s*(\d{4}))?', t, re.I)
-    if m:
-        month_map = {m:i for i,m in enumerate(["","January","February","March","April","May","June","July","August","September","October","November","December"])}
-        mo = month_map[m.group(1).capitalize()]
-        day = int(m.group(2))
-        year = int(m.group(3)) if m.group(3) else datetime.now(TZ_LOCAL).year
-        try: return TZ_LOCAL.localize(datetime(year, mo, day, 0, 0))
-        except Exception: return None
-    return None
-
-def parse_hltv_matches_page(html: str, base_url: str):
-    soup = BeautifulSoup(html, "html.parser")
-    matches = []
-    now_local = datetime.now(TZ_LOCAL)
-    horizon = now_local + timedelta(days=LOOKAHEAD_DAYS)
-
-    # знайдемо заголовки секцій з датами
-    sections = []
-    for h in soup.select("h2, h3, .eventDayHeader, .eventDayHeadline, .match-day"):
-        txt = h.get_text(" ", strip=True)
-        if re.search(r'\d{4}-\d{2}-\d{2}', txt) or re.search(r'(January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2}', txt, re.I):
-            sections.append((h, extract_section_date(txt)))
-    if not sections:
-        sections = [(soup, None)]
-
-    for head, section_date in sections:
-        parent = head if head is soup else head.parent
-
-        # Усі матчі в секції: елементи з data-unix або характерні блоки
-        items = parent.select('[data-unix]')
-        if not items:
-            items = parent.select('.match, .upcomingMatch, .matchbox, .standard-box')
-
-        for el in items:
-            # час
-            start_local = None
-            if el.has_attr("data-unix") and str(el.get("data-unix","")).isdigit():
-                start_local = unix_ms_to_kyiv(int(el["data-unix"]))
-            else:
-                # пошук видимого HH:MM
-                for node in el.select(".time, .matchTime, .match-time, .when, time"):
-                    s = node.get_text(" ", strip=True)
-                    dt = parse_time_str_to_section_date(s, section_date)
-                    if dt:
-                        start_local = dt; break
-
-            if not start_local:
-                continue
-            if start_local < now_local - timedelta(hours=3) or start_local > horizon:
-                continue
+            # посилання на матч
+            link_el = row.locator('a[href*="/matches/"]').first
+            href = ""
+            try:
+                href = link_el.get_attribute("href") or ""
+            except:
+                href = ""
+            match_link = ("https://bo3.gg" + href) if href else BO3_URL
 
             # команди
-            raw_text = el.get_text(" ", strip=True)
-            teams = [t.get_text(" ", strip=True) for t in el.select(".team, .opponent, .teamname, .text-ellipsis, .team1, .team2")]
-            teams = [t for t in teams if 1 <= len(t) <= 40]
-            uniq = []
-            for t in teams:
-                if t and t not in uniq:
-                    uniq.append(t)
-            team1 = team2 = None
-            if len(uniq) >= 2:
-                team1, team2 = uniq[0], uniq[1]
-            else:
-                mvs = re.search(r'([A-Za-z0-9\'\-\.\s]{2,40})\s+vs\s+([A-Za-z0-9\'\-\.\s]{2,40})', raw_text, re.I)
-                if mvs:
-                    team1, team2 = mvs.group(1).strip(), mvs.group(2).strip()
-            if not (team1 and team2):
-                continue
+            team_names = row.locator(".team-name")
+            tcount = team_names.count()
+            team1 = team_names.nth(0).inner_text().strip() if tcount >= 1 else ""
+            team2 = team_names.nth(1).inner_text().strip() if tcount >= 2 else "TBD"
 
-            # фільтр тільки NaVi
-            joined = f"{team1} {team2}"
-            if not (re.search(TEAM_PATTERNS[0], joined, re.I) or re.search(TEAM_PATTERNS[1], joined, re.I)):
-                continue
-
-            # формат та турнір
+            # формат (Bo3)
             bo = ""
-            mbo = re.search(r'\b(?:bo\s*?(\d)|best\s*of\s*(\d))\b', raw_text, re.I)
-            if mbo:
-                bo = f"Bo{mbo.group(1) or mbo.group(2)}"
+            try:
+                bo_text = row.locator(".bo-type").first.inner_text().strip()
+                if re.match(r"Bo\d", bo_text, flags=re.I):
+                    bo = bo_text
+            except:
+                pass
+
+            # турнір
             tournament = ""
-            ev = el.select_one(".event-name, .event, a[href^='/events/']")
-            if ev:
-                tournament = ev.get_text(" ", strip=True)
+            try:
+                tournament = row.locator(".tournament-name").first.inner_text().strip()
+            except:
+                pass
 
-            # лінк на матч
-            a = el.select_one("a[href^='/matches/']")
-            match_link = f"https://www.hltv.org{a['href']}" if a and a.has_attr("href") else base_url
+            # час/дата
+            time_text = ""
+            date_text = ""
+            try:
+                time_text = row.locator(".date .time").first.inner_text().strip()
+            except:
+                pass
+            try:
+                # .date містить і місяць/день і час — приберемо час
+                date_block = row.locator(".date").first.inner_text()
+                if date_block:
+                    date_text = date_block.replace(time_text, "").strip()
+            except:
+                pass
 
+            if not (time_text and date_text):
+                # Фолбек: спроба вирвати з plain text рядка
+                raw = row.inner_text().strip()
+                mt = re.search(r'\b(\d{1,2}:\d{2})\b', raw)
+                md = re.search(r'(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec|January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2}', raw, re.I)
+                if mt and md:
+                    time_text = mt.group(1)
+                    date_text = md.group(0)
+
+            if not (time_text and date_text):
+                continue  # без дати/часу не створюємо
+
+            md = _norm_month_day(date_text)
+            if not md:
+                continue
+            mon, day = md
+
+            # скласти datetime у Kyiv
+            try:
+                hh, mm = [int(x) for x in time_text.split(":")]
+            except:
+                continue
+
+            year = _infer_year_from_href(href, mon, day)
+            # час на сторінці вже у Києві (бо контекст timezone_id=Europe/Kyiv)
+            start_local = TZ_LOCAL.localize(datetime(year, mon, day, hh, mm))
             end_local = start_local + timedelta(hours=EVENT_DURATION_HOURS)
-            matches.append({
-                "summary": f"{team1} vs {team2}" + (f" ({bo})" if bo else "") + (f" — {tournament}" if tournament else ""),
+
+            summary = f"{team1} vs {team2}" + (f" ({bo})" if bo else "")
+            if tournament:
+                summary += f" — {tournament}"
+
+            out.append({
+                "summary": summary,
                 "start_dt_str": start_local.strftime("%Y-%m-%dT%H:%M:%S"),
                 "end_dt_str": end_local.strftime("%Y-%m-%dT%H:%M:%S"),
-                "link": match_link
+                "link": match_link,
             })
 
-    return matches
+        context.close()
+        browser.close()
+    return out
 
-def get_navi_matches():
-    # 1) desktop через cloudscraper/requests
-    html = fetch_html(HLTV_DESKTOP)
-    if html:
-        m = parse_hltv_matches_page(html, HLTV_DESKTOP)
-        print(f"[INFO] HLTV desktop parsed: {len(m)}")
-        if m:
-            return m
-    # 2) mobile fallback
-    htmlm = fetch_html(HLTV_MOBILE)
-    if htmlm:
-        m2 = parse_hltv_matches_page(htmlm, HLTV_MOBILE)
-        print(f"[INFO] HLTV mobile parsed: {len(m2)}")
-        if m2:
-            return m2
-    return []
-
-# ================== CALENDAR ==================
 def has_duplicate_event(service, calendar_id, start_dt, summary):
     time_min = (start_dt - timedelta(hours=3)).isoformat()
     time_max = (start_dt + timedelta(hours=3)).isoformat()
@@ -241,7 +176,7 @@ def has_duplicate_event(service, calendar_id, start_dt, summary):
     ).execute().get("items", [])
     for ev in items:
         if ev.get("summary","").startswith(" vs ".join(summary.split(" vs ")[:2])):
-            print(f"[SKIP] Duplicate: {ev.get('summary')} at {ev.get('start',{}).get('dateTime')}")
+            print(f"[SKIP] Duplicate around: {ev.get('summary')} at {ev.get('start',{}).get('dateTime')}")
             return True
     return False
 
@@ -249,11 +184,11 @@ def create_events(service, matches):
     created = 0
     for m in matches:
         start_dt = TZ_LOCAL.localize(datetime.strptime(m["start_dt_str"], "%Y-%m-%dT%H:%M:%S"))
-        if STRICT_DUP_CHECK and has_duplicate_event(service, CALENDAR_ID, start_dt, m["summary"]):
+        if has_duplicate_event(service, CALENDAR_ID, start_dt, m["summary"]):
             continue
         event = {
             "summary": m["summary"],
-            "description": f"Auto-added from {HLTV_DESKTOP}\nMatch page: {m['link']}",
+            "description": f"Auto-added from {BO3_URL}\nMatch page: {m['link']}",
             "start": {"dateTime": m["start_dt_str"], "timeZone": TIMEZONE},
             "end":   {"dateTime": m["end_dt_str"],   "timeZone": TIMEZONE},
         }
@@ -263,7 +198,6 @@ def create_events(service, matches):
         created += 1
     return created
 
-# ================== ENTRY ==================
 def main():
     creds_json = os.environ.get("GOOGLE_CREDENTIALS_JSON")
     if not creds_json:
@@ -272,11 +206,11 @@ def main():
     creds = Credentials.from_service_account_info(info, scopes=["https://www.googleapis.com/auth/calendar"])
     service = build("calendar", "v3", credentials=creds, cache_discovery=False)
 
-    print(f"[CHECK] Source: HLTV /matches via cloudscraper; TZ={TIMEZONE}")
-    matches = get_navi_matches()
-    print(f"[INFO] Total NAVI matches parsed: {len(matches)}")
+    print(f"[CHECK] Source: bo3.gg (Playwright); TZ={TIMEZONE}")
+    matches = scrape_matches()
+    print(f"[INFO] Parsed matches: {len(matches)}")
     if not matches:
-        print("[WARN] No NAVI matches parsed from HLTV /matches (desktop+mobile).")
+        print("[WARN] Nothing parsed — the page may have changed layout.")
         return
 
     created = create_events(service, matches)
