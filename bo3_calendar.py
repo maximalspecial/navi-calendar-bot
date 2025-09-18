@@ -5,7 +5,7 @@ import time
 import random
 import requests
 from bs4 import BeautifulSoup
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 import pytz
 
 from googleapiclient.discovery import build
@@ -35,9 +35,6 @@ UA_POOL = [
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0 Safari/537.36",
 ]
-
-TODAY_ALIASES = {"today", "сьогодні", "сегодня"}
-TOMORROW_ALIASES = {"tomorrow", "завтра"}
 
 def make_session():
     s = requests.Session()
@@ -76,38 +73,33 @@ def fetch_html(url: str) -> str | None:
         print(f"[ERROR] Fetch failed for {url}: {e}")
         return None
 
-def _parse_date_text_to_date(date_text: str, year_hint: int) -> tuple[int,int,int]:
+def _normalize_month_day(text: str) -> str:
     """
-    Приймає 'Aug 31' / 'August 31' / 'Today' / 'Сьогодні' / 'Tomorrow' / 'Завтра'
-    Повертає (year, month, day) у Києві.
+    Нормалізує 'sep 18' → 'Sep 18', 'september 18' → 'September 18', прибирає зайві крапки/пробіли.
     """
-    tz_local = pytz.timezone(TIMEZONE)
-    now_local = datetime.now(tz_local).date()
-    lower = date_text.strip().lower()
+    t = (text or "").strip().replace(".", " ")
+    t = re.sub(r"\s+", " ", t)
+    # титл-кейс дає 'Sep 18'/'September 18' навіть із 'sep 18'
+    return t.title()
 
-    if lower in TODAY_ALIASES:
-        d = now_local
-        return (d.year, d.month, d.day)
-    if lower in TOMORROW_ALIASES:
-        d = now_local + timedelta(days=1)
-        return (d.year, d.month, d.day)
+def _infer_year_from_href_or_today(href: str, month: int, day: int, tz) -> int:
+    """
+    Якщо в href є ...-DD-MM-YYYY — беремо його. Інакше — беремо поточний рік у Києві.
+    Якщо така дата вже минула → переносимо на наступний рік.
+    """
+    m = re.search(r"(\d{2})-(\d{2})-(\d{4})$", href or "")
+    if m:
+        return int(m.group(3))
 
-    # спробуємо англ. назви місяців
-    for fmt in ("%b %d", "%B %d"):
-        try:
-            tmp = datetime.strptime(date_text.strip(), fmt)
-            # tmp має 1900-й рік -> замінюємо на підказаний
-            return (year_hint, tmp.month, tmp.day)
-        except ValueError:
-            continue
-
-    # fallback: повернемо сьогодні
-    print(f"[WARN] Could not parse date label '{date_text}', fallback to today.")
-    return (now_local.year, now_local.month, now_local.day)
+    today_local = datetime.now(tz).date()
+    candidate = date(today_local.year, month, day)
+    if candidate < today_local:
+        return today_local.year + 1
+    return today_local.year
 
 def parse_upcoming_matches():
     """
-    Парсить майбутні/поточні матчі NaVi з bo3.gg.
+    Парсить матчі NaVi з bo3.gg (будь-які .table-row).
     Повертає список словників зі строковими dateTime без офсету.
     """
     html = fetch_html(BO3_URL)
@@ -117,15 +109,9 @@ def parse_upcoming_matches():
 
     soup = BeautifulSoup(html, "html.parser")
 
-    # Візьмемо не лише upcoming, а й live/ongoing/today/featured
-    rows = soup.select(
-        ".table-row.table-row--upcoming, "
-        ".table-row.table-row--live, "
-        ".table-row.table-row--ongoing, "
-        ".table-row.table-row--today, "
-        ".table-row.table-row--featured"
-    )
-    print(f"[INFO] Rows matched: {len(rows)}")
+    # Забираємо всі рядки матчів
+    rows = soup.select(".table-row")
+    print(f"[INFO] Rows matched (any .table-row): {len(rows)}")
 
     matches = []
     tz_local = pytz.timezone(TIMEZONE)
@@ -134,10 +120,10 @@ def parse_upcoming_matches():
         row_classes = row.get("class", [])
         a = row.select_one('a.c-global-match-link.table-cell[href]')
         if not a:
-            print(f"[DEBUG] Row {idx}: no main link; classes={row_classes}")
+            # можливі інші типи рядків (без посилання на матч)
             continue
 
-        href = a["href"]
+        href = a.get("href", "")
         link = "https://bo3.gg" + href
 
         # Команди
@@ -156,7 +142,7 @@ def parse_upcoming_matches():
         tour_el = row.select_one(".table-cell.tournament .tournament-name")
         tournament = tour_el.get_text(strip=True) if tour_el else ""
 
-        # Час і дата (raw для дебагу)
+        # Час і дата (можуть бути 'sep 18' без року і у нижньому регістрі)
         time_el = row.select_one(".date .time")
         time_text = time_el.get_text(strip=True) if time_el else None
 
@@ -166,38 +152,38 @@ def parse_upcoming_matches():
             raw = date_el.get_text(" ", strip=True)
             if time_text:
                 raw = raw.replace(time_text, "").strip()
-            date_text = raw
+            date_text = _normalize_month_day(raw)  # -> 'Sep 18' / 'September 18'
 
-        # Рік із URL типу ...-DD-MM-YYYY
-        year_int = None
-        m = re.search(r"(\d{2})-(\d{2})-(\d{4})$", href)
-        if m:
-            year_int = int(m.group(3))
-        if not year_int:
-            # Якщо місяць у підписі вже пройшов і ми наприкінці року — можна доробити логику на +1 рік,
-            # але базово лишаємо поточний.
-            year_int = datetime.now(tz_local).year
-
-        print(f"[DEBUG] Row {idx}: classes={row_classes}, href={href}, date_text={date_text}, time_text={time_text}, year={year_int}")
+        print(f"[DEBUG] Row {idx}: classes={row_classes}, href={href}, date_text={date_text}, time_text={time_text}")
 
         if not (date_text and time_text):
-            print(f"[WARN] Row {idx}: missing date/time for {team1} vs {team2} @ {link}")
+            continue  # без дати чи часу сенсу немає
+
+        # Парсимо місяць/день із нормалізованого тексту
+        parsed_md = None
+        for fmt in ("%b %d", "%B %d"):
+            try:
+                parsed_md = datetime.strptime(date_text, fmt)
+                break
+            except ValueError:
+                continue
+        if not parsed_md:
+            print(f"[WARN] Row {idx}: could not parse month/day '{date_text}'")
             continue
 
-        # Розкладаємо date_text у (y,m,d), підтримуючи Today/Tomorrow/локалізовані варіанти
-        y, m, d = _parse_date_text_to_date(date_text, year_int)
+        # Визначаємо рік
+        year_int = _infer_year_from_href_or_today(href, parsed_md.month, parsed_md.day, tz_local)
 
-        # Будуємо naive datetime з розпаршеного часу (наприклад, '12:30')
+        # Будуємо naive datetime з розпаршеного часу
         try:
             hh, mm = time_text.split(":")
-            start_naive = datetime(y, m, d, int(hh), int(mm))
+            start_naive = datetime(year_int, parsed_md.month, parsed_md.day, int(hh), int(mm))
         except Exception as e:
             print(f"[ERROR] Row {idx}: time parse failed '{time_text}' → {e}")
             continue
 
         # Конвертація часових поясів
         if SCRAPED_TIME_IS_UTC:
-            # інтерпретуємо як UTC і переводимо у Київ
             start_local = pytz.utc.localize(start_naive).astimezone(tz_local)
             print(f"[TZ] Row {idx}: UTC→Kyiv {start_local.isoformat()}")
         else:
@@ -206,9 +192,9 @@ def parse_upcoming_matches():
 
         end_local = start_local + timedelta(hours=2)
 
-        # Для Google Calendar передаємо dateTime БЕЗ офсету
+        # Для Google Calendar — dateTime БЕЗ офсету
         start_dt_str = start_local.strftime("%Y-%m-%dT%H:%M:%S")
-        end_dt_str = end_local.strftime("%Y-%m-%dT%H:%M:%S")
+        end_dt_str   = end_local.strftime("%Y-%m-%dT%H:%M:%S")
 
         # Заголовок
         summary_main = f"{team1} vs {team2}"
@@ -221,98 +207,3 @@ def parse_upcoming_matches():
             "start_dt_str": start_dt_str,
             "end_dt_str": end_dt_str,
             "link": link,
-            "tournament": tournament,
-            "bo": bo
-        })
-
-    return matches
-
-def has_duplicate_event(service, calendar_id, start_dt, summary):
-    """Перевірка на дублі в інтервалі [-1h, +3h] від старту."""
-    time_min = (start_dt - timedelta(hours=1)).isoformat()
-    time_max = (start_dt + timedelta(hours=3)).isoformat()
-    items = service.events().list(
-        calendarId=calendar_id,
-        timeMin=time_min,
-        timeMax=time_max,
-        singleEvents=True,
-        orderBy="startTime",
-        q=summary.split(" — ")[0]
-    ).execute().get("items", [])
-
-    for ev in items:
-        ev_summary = ev.get("summary", "")
-        ev_start = ev.get("start", {}).get("dateTime")
-        if ev_summary == summary and ev_start:
-            print(f"[SKIP] Duplicate found: {summary} at {ev_start}")
-            return True
-    return False
-
-def create_events(service, matches):
-    created = 0
-    tz_local = pytz.timezone(TIMEZONE)
-
-    for m in matches:
-        start_dt = datetime.strptime(m["start_dt_str"], "%Y-%m-%dT%H:%M:%S")
-        start_dt = tz_local.localize(start_dt)
-
-        if has_duplicate_event(service, CALENDAR_ID, start_dt, m["summary"]):
-            continue
-
-        event = {
-            "summary": m["summary"],
-            "description": f"Auto-added from {BO3_URL}\nMatch page: {m['link']}",
-            "start": {"dateTime": m["start_dt_str"], "timeZone": TIMEZONE},
-            "end":   {"dateTime": m["end_dt_str"],   "timeZone": TIMEZONE},
-        }
-        print("[DEBUG] Prepared event:", event)
-
-        res = service.events().insert(calendarId=CALENDAR_ID, body=event).execute()
-        html_link = res.get("htmlLink", "")
-        print(f"[OK] Created: {m['summary']} → {html_link}")
-        created += 1
-
-    return created
-
-def main():
-    # Авторизація
-    creds_json = os.environ.get("GOOGLE_CREDENTIALS_JSON")
-    if not creds_json:
-        raise RuntimeError("GOOGLE_CREDENTIALS_JSON env var is missing. Add it to GitHub Secrets.")
-    info = json.loads(creds_json)
-
-    client_email = info.get("client_email", "UNKNOWN_SERVICE_ACCOUNT")
-    print(f"[CHECK] Service Account: {client_email}")
-    print(f"[CHECK] SCRAPED_TIME_IS_UTC={SCRAPED_TIME_IS_UTC}")
-
-    creds = Credentials.from_service_account_info(
-        info,
-        scopes=["https://www.googleapis.com/auth/calendar"]
-    )
-    service = build("calendar", "v3", credentials=creds, cache_discovery=False)
-
-    # Перевірка доступу до календаря
-    try:
-        info_cal = service.calendars().get(calendarId=CALENDAR_ID).execute()
-        print(f"[CHECK] Using calendar: {info_cal.get('summary')} (id={info_cal.get('id')})")
-    except Exception:
-        print(f"[ERROR] Calendar '{CALENDAR_ID}' not accessible.\n"
-              f"• Перевір, що ID без пробілів/переносів (наприклад, 'primary' або точний ID з налаштувань)\n"
-              f"• Поділись календарем із {client_email} з правами 'Make changes to events'")
-        return
-
-    matches = parse_upcoming_matches()
-    print(f"[INFO] Found {len(matches)} rows after parse.")
-
-    if not matches:
-        print("[WARN] No matches parsed (maybe label 'Today'/'Tomorrow', live-only rows, or network).")
-        return
-
-    for m in matches:
-        print(f"  - {m['summary']} @ {m['start_dt_str']} ({TIMEZONE}) → {m['link']}")
-
-    created = create_events(service, matches)
-    print(f"[DONE] Created {created} events.")
-
-if __name__ == "__main__":
-    main()
