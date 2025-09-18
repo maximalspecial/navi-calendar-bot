@@ -21,7 +21,7 @@ CALENDAR_ID = (os.environ.get("CALENDAR_ID") or "").strip() or "primary"
 # На CI HTML часто віддає UTC-час → конвертуємо в Kyiv (true = UTC→Kyiv)
 SCRAPED_TIME_IS_UTC = (os.environ.get("SCRAPED_TIME_IS_UTC", "true").lower() in ("1","true","yes"))
 
-# На час діагностики відключимо перевірку дублів (щоб подія точно створилась)
+# На час діагностики: якщо хочеш знов увімкнути жорстку перевірку дублів, вистав STRICT_DUP_CHECK=true
 STRICT_DUP_CHECK = (os.environ.get("STRICT_DUP_CHECK", "false").lower() in ("1","true","yes"))
 
 READ_TIMEOUT = 45
@@ -75,6 +75,23 @@ def fetch_html(url):
     except requests.RequestException as e:
         print(f"[ERROR] Fetch failed {url}: {e}")
         return None
+
+def try_fetch_variants():
+    """Пробуємо різні варіанти URL, поки не отримаємо хоч якісь матчі."""
+    variants = [
+        BO3_URL,
+        BO3_URL + "?amp=1",
+        BO3_URL.replace("/teams/", "/en/teams/"),
+        BO3_URL.replace("/teams/", "/ua/teams/"),
+        BO3_URL.replace("https://", "http://"),  # інколи допомагає проти суворого CDN
+    ]
+    seen = set()
+    for u in variants:
+        if u in seen: continue
+        seen.add(u)
+        html = fetch_html(u)
+        if html:
+            yield u, html
 
 # ===== parsing utils =====
 def normalize_month_day(text:str) -> str:
@@ -137,49 +154,36 @@ def parse_detail_datetime(detail_url, href_tail, tz_local):
     return (pytz.utc.localize(start_naive).astimezone(tz_local)
             if SCRAPED_TIME_IS_UTC else tz_local.localize(start_naive))
 
-# ===== main list parser =====
-def parse_rows():
-    html = fetch_html(BO3_URL)
-    if not html: return []
-    soup = BeautifulSoup(html, "html.parser")
-    # Забираємо будь-які рядки матчів
+# ===== parsers =====
+def parse_table_rows(soup: BeautifulSoup):
     rows = soup.select(".table-row, [class*='table-row']")
-    print(f"[INFO] Row count = {len(rows)}")
-
-    tz_local = pytz.timezone(TIMEZONE)
     matches = []
-    candidates_log = []
+    tz_local = pytz.timezone(TIMEZONE)
+    print(f"[INFO] Table-like rows found: {len(rows)}")
 
     for idx, row in enumerate(rows, start=1):
-        # 1) посилання на матч (максимально вільний селектор)
         a = row.select_one('a[href*="/matches/"]')
         href = a.get("href","") if a else ""
-        link = "https://bo3.gg" + href if href else BO3_URL  # навіть без лінку створимо подію
+        link = "https://bo3.gg" + href if href else BO3_URL
 
-        # 2) команди (або з .team-name, або з plain text)
         teams = [el.get_text(strip=True) for el in row.select(".team-name")]
         if len(teams) >= 2:
             team1, team2 = teams[0], teams[1]
         else:
-            # спроба витягти з тексту
             raw_text = row.get_text(" ", strip=True)
             m_vs = re.search(r'([A-Za-z0-9 .\-]+)\s+vs\s+([A-Za-z0-9 .\-]+)', raw_text, flags=re.I)
             if m_vs:
                 team1, team2 = m_vs.group(1).strip(), m_vs.group(2).strip()
             else:
-                # якщо не бачимо NaVi у рядку — пропускаємо
                 if "Natus Vincere" not in raw_text and "NAVI" not in raw_text.upper():
                     continue
                 team1, team2 = "Natus Vincere", "TBD"
 
-        # 3) формат (Bo3)
         bo_el = row.select_one(".bo-type")
         bo = bo_el.get_text(strip=True) if bo_el else ""
-        # 4) турнір
         tour_el = row.select_one(".tournament-name")
         tournament = tour_el.get_text(strip=True) if tour_el else ""
 
-        # 5) час/дата: спочатку DOM...
         time_el = row.select_one(".date .time")
         date_el = row.select_one(".date")
         time_text = time_el.get_text(strip=True) if time_el else None
@@ -189,20 +193,14 @@ def parse_rows():
             if time_text: raw = raw.replace(time_text,"").strip()
             date_text = normalize_month_day(raw) if raw else None
 
-        # ... якщо нема — з plain text усього рядка
         if not (date_text and time_text):
             raw_all = row.get_text(" ", strip=True)
             maybe = parse_hhmm_and_md_from_text(raw_all)
             if maybe:
                 date_text, time_text = maybe
-                print(f"[INFO] Row {idx}: extracted from raw text → date='{date_text}', time='{time_text}'")
+                print(f"[INFO] Row {idx}: extracted from raw text → {date_text} {time_text}")
 
-        # збережемо кандидат-лог
-        candidates_log.append((idx, team1, team2, bo, tournament, date_text, time_text, href))
-
-        # якщо все ще бракує часу/дати — підемо в детальну (якщо є URL)
         start_local = None
-        tz_local = pytz.timezone(TIMEZONE)
         if date_text and time_text:
             parsed_md = None
             for fmt in ("%b %d","%B %d"):
@@ -224,7 +222,6 @@ def parse_rows():
             print(f"[FALLBACK] Row {idx}: detail parsed = {bool(start_local)}; url={link}")
 
         if start_local is None:
-            # Ні часу/дати — пропускаємо
             continue
 
         end_local = start_local + timedelta(hours=2)
@@ -242,18 +239,89 @@ def parse_rows():
             "tournament": tournament,
             "bo": bo
         })
-        print(f"[OK] Row {idx} parsed: {summary} @ {start_dt_str} ({TIMEZONE}) → {link}")
 
-    # друк усіх кандидатів (для діагностики)
-    print("[CANDIDATES]")
-    for idx, t1, t2, bo, tour, d, tm, href in candidates_log:
-        print(f"  Row {idx}: teams=('{t1}','{t2}') bo='{bo}' tour='{tour}' date='{d}' time='{tm}' href='{href}'")
+    return matches
+
+def raw_scan_matches(html: str):
+    """
+    Коли взагалі немає .table-row (JS дорендерює), скануємо сирий HTML:
+    беремо усі href="/matches/..." і на відстані ±600 символів шукаємо час, дату, команди.
+    """
+    tz_local = pytz.timezone(TIMEZONE)
+    matches = []
+    # усі унікальні посилання на матч
+    hrefs = list(dict.fromkeys(re.findall(r'href="(/matches/[^"]+)"', html)))
+    print(f"[INFO] Raw scan: found {len(hrefs)} match hrefs")
+
+    for i, href in enumerate(hrefs, start=1):
+        link = "https://bo3.gg" + href
+        # знайдемо вікно контенту навколо href (±600 символів)
+        for m in re.finditer(re.escape(href), html):
+            start = max(0, m.start()-600); end = min(len(html), m.end()+600)
+            chunk = html[start:end]
+            # час + дата
+            maybe = parse_hhmm_and_md_from_text(chunk)
+            if not maybe:
+                continue
+            date_text, time_text = maybe
+            # команди (спробуємо з chunk)
+            m_vs = re.search(r'([A-Za-z0-9 .\-]+)\s+vs\s+([A-Za-z0-9 .\-]+)', chunk, flags=re.I)
+            if m_vs:
+                team1, team2 = m_vs.group(1).strip(), m_vs.group(2).strip()
+            else:
+                # На всякий випадок — якщо десь поруч згадано NaVi
+                if re.search(r'Natus\s+Vincere|NAVI', chunk, flags=re.I):
+                    team1, team2 = "Natus Vincere", "TBD"
+                else:
+                    # не наш матч — йдемо далі
+                    continue
+
+            # турнір
+            tour = ""
+            mt = re.search(r'(StarSeries|BLAST|ESL|IEM|Major|Qualifier|Cup|League|Open|Showdown)[^<>\n]{0,60}', chunk, flags=re.I)
+            if mt: tour = mt.group(0).strip()
+
+            # нормалізація дати
+            parsed_md = None
+            for fmt in ("%b %d","%B %d"):
+                try:
+                    parsed_md = datetime.strptime(normalize_month_day(date_text), fmt); break
+                except ValueError: continue
+            if not parsed_md: 
+                continue
+
+            # рік: з href або поточний/наступний
+            y = infer_year(href, parsed_md.month, parsed_md.day, tz_local)
+
+            # збірка часу
+            try:
+                hh, mm = time_text.split(":")
+                start_naive = datetime(y, parsed_md.month, parsed_md.day, int(hh), int(mm))
+            except Exception:
+                continue
+
+            start_local = (pytz.utc.localize(start_naive).astimezone(tz_local)
+                           if SCRAPED_TIME_IS_UTC else tz_local.localize(start_naive))
+            end_local = start_local + timedelta(hours=2)
+            start_dt_str = start_local.strftime("%Y-%m-%dT%H:%M:%S")
+            end_dt_str   = end_local.strftime("%Y-%m-%dT%H:%M:%S")
+
+            summary = f"{team1} vs {team2}"
+            if tour: summary += f" — {tour}"
+
+            matches.append({
+                "summary": summary,
+                "start_dt_str": start_dt_str,
+                "end_dt_str": end_dt_str,
+                "link": link,
+            })
+            print(f"[RAW] #{i}: {summary} @ {start_dt_str} ({TIMEZONE}) ← {link}")
+            break  # досить першого успішного вікна
 
     return matches
 
 # ===== Calendar helpers =====
 def has_duplicate_event(service, calendar_id, start_dt, summary):
-    # розширене вікно (±3h)
     time_min = (start_dt - timedelta(hours=3)).isoformat()
     time_max = (start_dt + timedelta(hours=3)).isoformat()
     items = service.events().list(
@@ -263,7 +331,7 @@ def has_duplicate_event(service, calendar_id, start_dt, summary):
     ).execute().get("items", [])
     for ev in items:
         if ev.get("summary","").startswith(" vs ".join(summary.split(" vs ")[:2])):
-            print(f"[SKIP] Duplicate around this time: {ev.get('summary')} at {ev.get('start',{}).get('dateTime')}")
+            print(f"[SKIP] Duplicate: {ev.get('summary')} at {ev.get('start',{}).get('dateTime')}")
             return True
     return False
 
@@ -272,12 +340,13 @@ def create_events(service, matches):
     created = 0
     for m in matches:
         start_dt = tz_local.localize(datetime.strptime(m["start_dt_str"], "%Y-%m-%dT%H:%M:%S"))
-        if STRICT_DUP_CHECK:
-            if has_duplicate_event(service, CALENDAR_ID, start_dt, m["summary"]):
-                continue
+
+        if STRICT_DUP_CHECK and has_duplicate_event(service, CALENDAR_ID, start_dt, m["summary"]):
+            continue
+
         event = {
             "summary": m["summary"],
-            "description": f"Auto-added from {BO3_URL}\nMatch page: {m['link']}",
+            "description": f"Auto-added from {BO3_URL}\nMatch page: {m.get('link','')}",
             "start": {"dateTime": m["start_dt_str"], "timeZone": TIMEZONE},
             "end":   {"dateTime": m["end_dt_str"],   "timeZone": TIMEZONE},
         }
@@ -297,13 +366,38 @@ def main():
     creds = Credentials.from_service_account_info(info, scopes=["https://www.googleapis.com/auth/calendar"])
     service = build("calendar", "v3", credentials=creds, cache_discovery=False)
 
-    matches = parse_rows()
-    print(f"[INFO] Parsed {len(matches)} matches total.")
-    if not matches:
+    all_matches = []
+
+    # 1) спроба через normal/amp/locales
+    for url, html in try_fetch_variants():
+        soup = BeautifulSoup(html, "html.parser")
+        matches = parse_table_rows(soup)
+        print(f"[INFO] {url} → table parser found {len(matches)} matches")
+        all_matches.extend(matches)
+
+        # Якщо сторінка зовсім без таблиці — спробуємо raw-скан
+        if not matches:
+            raw_matches = raw_scan_matches(html)
+            print(f"[INFO] {url} → raw scan found {len(raw_matches)} matches")
+            all_matches.extend(raw_matches)
+
+        # якщо щось знайшли — далі варіанти не потрібні
+        if all_matches:
+            break
+
+    # видалимо можливі дублікати (по summary+start_dt_str)
+    uniq = {}
+    for m in all_matches:
+        key = (m["summary"], m["start_dt_str"])
+        uniq[key] = m
+    matches_final = list(uniq.values())
+
+    print(f"[INFO] Parsed {len(matches_final)} matches total.")
+    if not matches_final:
         print("[WARN] Nothing parsed → nothing to create.")
         return
 
-    created = create_events(service, matches)
+    created = create_events(service, matches_final)
     print(f"[DONE] Created {created} events.")
 
 if __name__ == "__main__":
