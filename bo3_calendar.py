@@ -12,9 +12,9 @@ TIMEZONE = "Europe/Kyiv"
 CALENDAR_ID = (os.environ.get("CALENDAR_ID") or "").strip() or "primary"
 EVENT_DURATION_HOURS = 2
 
-# Якщо час на сторінці показується у ЛОКАЛЬНІЙ зоні браузера (так і є),
-# ми ставимо контексту таймзону Europe/Kyiv і парсимо як локальний.
-SCRAPED_TIME_IS_LOCAL = True
+# Фільтри часу
+LOOKAHEAD_DAYS = int(os.environ.get("LOOKAHEAD_DAYS", "60"))          # події не далі цього горизонту
+PAST_GRACE_MINUTES = int(os.environ.get("PAST_GRACE_MINUTES", "0"))   # скільки хвилин минулого дозволяємо
 
 MONTHS = {
     "jan":1,"feb":2,"mar":3,"apr":4,"may":5,"jun":6,
@@ -36,7 +36,6 @@ def _infer_year_from_href(href: str, month: int, day: int) -> int:
 def _norm_month_day(text: str):
     if not text: return None
     t = re.sub(r"\s+", " ", text.replace(".", " ")).strip()
-    # очікуємо "Sep 18" або "September 18"
     m = re.match(r"([A-Za-z]+)\s+(\d{1,2})", t)
     if not m: return None
     mon = m.group(1).lower()
@@ -46,15 +45,19 @@ def _norm_month_day(text: str):
 
 def scrape_matches():
     """
-    Відкриваємо сторінку в Chromium (headless), чекаємо поки намалюється таблиця,
-    і дістаємо дані з DOM (без обходу на матч, бо час є у рядку).
+    Відкриваємо сторінку у Chromium (headless), чекаємо рендеру й дістаємо матчі з DOM.
+    Повертаємо ТІЛЬКИ сьогоднішні/майбутні (з урахуванням PAST_GRACE_MINUTES).
     """
     out = []
+    now_local = datetime.now(TZ_LOCAL)
+    horizon = now_local + timedelta(days=LOOKAHEAD_DAYS)
+    grace_cutoff = now_local - timedelta(minutes=PAST_GRACE_MINUTES)
+
     with sync_playwright() as pw:
         browser = pw.chromium.launch(headless=True)
         context = browser.new_context(
             locale="en-US",
-            timezone_id=TIMEZONE,  # критично: щоб .time на сайті вже був у Києві
+            timezone_id=TIMEZONE,
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0 Safari/537.36",
             viewport={"width": 1366, "height": 900},
         )
@@ -62,9 +65,7 @@ def scrape_matches():
         page.set_default_timeout(30000)
 
         page.goto(BO3_URL, wait_until="domcontentloaded")
-        # Дочекаємося появи будь-яких рядків (сайт іноді підвантажує частинами)
         page.wait_for_timeout(1500)
-        # Якщо таблиця не з’явилась відразу — спробуємо почекати рендер
         for _ in range(5):
             if page.locator(".table-row").count() > 0:
                 break
@@ -116,7 +117,6 @@ def scrape_matches():
             except:
                 pass
             try:
-                # .date містить і місяць/день і час — приберемо час
                 date_block = row.locator(".date").first.inner_text()
                 if date_block:
                     date_text = date_block.replace(time_text, "").strip()
@@ -124,7 +124,6 @@ def scrape_matches():
                 pass
 
             if not (time_text and date_text):
-                # Фолбек: спроба вирвати з plain text рядка
                 raw = row.inner_text().strip()
                 mt = re.search(r'\b(\d{1,2}:\d{2})\b', raw)
                 md = re.search(r'(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec|January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2}', raw, re.I)
@@ -133,23 +132,29 @@ def scrape_matches():
                     date_text = md.group(0)
 
             if not (time_text and date_text):
-                continue  # без дати/часу не створюємо
+                continue
 
             md = _norm_month_day(date_text)
             if not md:
                 continue
             mon, day = md
 
-            # скласти datetime у Kyiv
             try:
                 hh, mm = [int(x) for x in time_text.split(":")]
             except:
                 continue
 
             year = _infer_year_from_href(href, mon, day)
-            # час на сторінці вже у Києві (бо контекст timezone_id=Europe/Kyiv)
             start_local = TZ_LOCAL.localize(datetime(year, mon, day, hh, mm))
             end_local = start_local + timedelta(hours=EVENT_DURATION_HOURS)
+
+            # === ФІЛЬТР ЧАСУ: тільки сьогодні/майбутні (з грейсом) ===
+            if start_local < grace_cutoff:
+                # старіше ніж дозволений грейс — скіпаємо
+                continue
+            if start_local > horizon:
+                # занадто далеко в майбутньому — скіпаємо
+                continue
 
             summary = f"{team1} vs {team2}" + (f" ({bo})" if bo else "")
             if tournament:
@@ -207,10 +212,11 @@ def main():
     service = build("calendar", "v3", credentials=creds, cache_discovery=False)
 
     print(f"[CHECK] Source: bo3.gg (Playwright); TZ={TIMEZONE}")
+    print(f"[CHECK] Filters: LOOKAHEAD_DAYS={LOOKAHEAD_DAYS}, PAST_GRACE_MINUTES={PAST_GRACE_MINUTES}")
     matches = scrape_matches()
-    print(f"[INFO] Parsed matches: {len(matches)}")
+    print(f"[INFO] Parsed matches after filtering: {len(matches)}")
     if not matches:
-        print("[WARN] Nothing parsed — the page may have changed layout.")
+        print("[WARN] Nothing parsed (or everything filtered out).")
         return
 
     created = create_events(service, matches)
