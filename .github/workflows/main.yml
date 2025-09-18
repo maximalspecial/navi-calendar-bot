@@ -1,24 +1,46 @@
-name: Bo3 NaVi Calendar Bot
+name: NAVI Calendar Bot
 
 on:
+  workflow_dispatch: {}   # запуск вручну з вкладки Actions
   schedule:
-    - cron: "0 */6 * * *"   # запуск кожні 6 годин
-  workflow_dispatch:         # можливість запускати вручну
+    # опціонально: запускай щогодини (UTC). Можеш підкрутити як потрібно.
+    - cron: "0 * * * *"
 
 jobs:
-  run-bot:
+  run:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    env:
+      # ці два СЕКРЕТИ обов'язково додай в репозиторій:
+      # Settings → Secrets and variables → Actions → New repository secret
+      GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
+      CALENDAR_ID: ${{ secrets.CALENDAR_ID }}
+
+      # опційно:
+      # STRICT_DUP_CHECK: "true"      # не створювати дублікати (рекомендовано true)
+      # LOOKAHEAD_DAYS: "60"         # горизон планування
+      # (нічого більше для Playwright не треба)
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - name: Install dependencies
-        run: pip install -r requirements.txt
+
+      - name: Install Python deps
+        run: |
+            python -m pip install --upgrade pip
+            pip install -r requirements.txt
+
+      - name: Install Playwright (Chromium + system deps)
+        run: |
+            python -m playwright install --with-deps chromium
+
       - name: Run bot
-        env:
-          GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
-          CALENDAR_ID: ${{ secrets.CALENDAR_ID }}
-          SCRAPED_TIME_IS_UTC: "true"  
-        run: python bo3_calendar.py
+        run: |
+            python bo3_calendar.py
