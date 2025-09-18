@@ -1,7 +1,7 @@
-google-api-python-client
-google-auth
-google-auth-httplib2
-beautifulsoup4
-requests
-pytz
-cloudscraper==1.2.71
+playwright==1.47.0
+google-api-python-client==2.142.0
+google-auth==2.33.0
+google-auth-httplib2==0.2.0
+beautifulsoup4==4.12.3
+pytz==2024.1
+requests==2.32.3
