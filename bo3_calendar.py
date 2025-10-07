@@ -256,17 +256,39 @@ def create_events(service, matches):
         created += 1
     return created, updated
 
-def _has_match_today(matches):
-    today = datetime.now(TZ_LOCAL).date()
+def _calc_today_recheck(matches) -> Tuple[Optional[int], Optional[datetime]]:
+    now_local = datetime.now(TZ_LOCAL)
+    today = now_local.date()
+    grace = timedelta(minutes=PAST_GRACE_MINUTES)
+    relevant_starts = []
+
     for m in matches:
         try:
-            start_date = datetime.strptime(m["start_dt_str"], "%Y-%m-%dT%H:%M:%S").date()
+            start_naive = datetime.strptime(m["start_dt_str"], "%Y-%m-%dT%H:%M:%S")
+            start_local = TZ_LOCAL.localize(start_naive)
         except Exception as exc:
             print(f"[WARN] Failed to parse match start '{m.get('start_dt_str')}' for today check: {exc}")
             continue
-        if start_date == today:
-            return True
-    return False
+
+        if start_local.date() != today:
+            continue
+
+        if start_local < now_local - grace:
+            continue
+
+        relevant_starts.append(start_local)
+
+    if not relevant_starts:
+        return None, None
+
+    soonest_start = min(relevant_starts)
+    base_delay = max(1, TODAY_RECHECK_INTERVAL_SECONDS)
+
+    if soonest_start > now_local:
+        seconds_until_start = int((soonest_start - now_local).total_seconds())
+        base_delay = min(base_delay, max(1, seconds_until_start))
+
+    return base_delay, soonest_start
 
 def sync_matches(service):
     print(f"[CHECK] Source: bo3.gg (Playwright); TZ={TIMEZONE}")
@@ -296,12 +318,18 @@ def main():
         if not matches:
             break
 
-        if _has_match_today(matches):
-            next_run = TODAY_RECHECK_INTERVAL_SECONDS
-            print(
-                f"[INFO] Detected match scheduled for today. Sleeping {next_run // 60} minutes before re-check."
-            )
-            time.sleep(next_run)
+        recheck_delay, next_today_start = _calc_today_recheck(matches)
+        if recheck_delay is not None:
+            if next_today_start:
+                start_str = next_today_start.strftime("%H:%M")
+                print(
+                    f"[INFO] Match today (next at {start_str}). Sleeping {recheck_delay} seconds before re-check."
+                )
+            else:
+                print(
+                    f"[INFO] Match today. Sleeping {recheck_delay} seconds before re-check."
+                )
+            time.sleep(recheck_delay)
             iteration += 1
             continue
 
