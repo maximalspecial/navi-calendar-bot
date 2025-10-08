@@ -1,6 +1,5 @@
 import os, re, json, time
 from datetime import datetime, timedelta, date
-from typing import Optional, Tuple
 import pytz
 
 from googleapiclient.discovery import build
@@ -12,7 +11,6 @@ BO3_URL = "https://bo3.gg/teams/natus-vincere/matches"
 TIMEZONE = "Europe/Kyiv"
 CALENDAR_ID = (os.environ.get("CALENDAR_ID") or "").strip() or "primary"
 EVENT_DURATION_HOURS = 2
-TODAY_RECHECK_INTERVAL_SECONDS = int(os.environ.get("TODAY_RECHECK_INTERVAL_SECONDS", "3600"))
 
 # Фільтри часу
 LOOKAHEAD_DAYS = int(os.environ.get("LOOKAHEAD_DAYS", "60"))          # події не далі цього горизонту
@@ -173,77 +171,26 @@ def scrape_matches():
         browser.close()
     return out
 
-def _base_summary(summary: str) -> str:
-    return " vs ".join(summary.split(" vs ")[:2])
-
-def _parse_event_start(event) -> Optional[datetime]:
-    start_raw = (event.get("start", {}) or {}).get("dateTime")
-    if not start_raw:
-        return None
-    try:
-        dt = datetime.fromisoformat(start_raw)
-        if dt.tzinfo is None:
-            return TZ_LOCAL.localize(dt)
-        return dt.astimezone(TZ_LOCAL)
-    except Exception as exc:
-        print(f"[WARN] Failed to parse existing event start '{start_raw}': {exc}")
-        return None
-
-def find_existing_event(service, calendar_id, summary: str, start_dt: datetime) -> Tuple[Optional[dict], Optional[float]]:
-    base = _base_summary(summary)
-    now_local = datetime.now(TZ_LOCAL)
-    time_min = (now_local - timedelta(days=7)).isoformat()
-    time_max = (now_local + timedelta(days=max(LOOKAHEAD_DAYS, 7))).isoformat()
+def has_duplicate_event(service, calendar_id, start_dt, summary):
+    time_min = (start_dt - timedelta(hours=3)).isoformat()
+    time_max = (start_dt + timedelta(hours=3)).isoformat()
     items = service.events().list(
-        calendarId=calendar_id,
-        timeMin=time_min,
-        timeMax=time_max,
-        singleEvents=True,
-        orderBy="startTime",
-        q=base,
+        calendarId=calendar_id, timeMin=time_min, timeMax=time_max,
+        singleEvents=True, orderBy="startTime",
+        q=" vs ".join(summary.split(" vs ")[:2])
     ).execute().get("items", [])
-
-    best = None
-    best_diff = None
     for ev in items:
-        ev_summary = ev.get("summary", "")
-        if not ev_summary.startswith(base):
-            continue
-        ev_start = _parse_event_start(ev)
-        if not ev_start:
-            continue
-        diff = abs((ev_start - start_dt).total_seconds())
-        if best is None or diff < best_diff:
-            best = ev
-            best_diff = diff
-    return best, best_diff
+        if ev.get("summary","").startswith(" vs ".join(summary.split(" vs ")[:2])):
+            print(f"[SKIP] Duplicate around: {ev.get('summary')} at {ev.get('start',{}).get('dateTime')}")
+            return True
+    return False
 
 def create_events(service, matches):
     created = 0
-    updated = 0
     for m in matches:
         start_dt = TZ_LOCAL.localize(datetime.strptime(m["start_dt_str"], "%Y-%m-%dT%H:%M:%S"))
-        existing, diff = find_existing_event(service, CALENDAR_ID, m["summary"], start_dt)
-        if existing:
-            if diff is not None and diff <= 5 * 60 and existing.get("summary") == m["summary"]:
-                print(f"[SKIP] Up-to-date event exists: {existing.get('summary')} at {existing.get('start',{}).get('dateTime')}")
-                continue
-
-            event_id = existing.get("id")
-            if not event_id:
-                print(f"[WARN] Existing event without ID, creating new one: {m['summary']}")
-            else:
-                patch_body = {
-                    "summary": m["summary"],
-                    "description": f"Auto-added from {BO3_URL}\nMatch page: {m['link']}",
-                    "start": {"dateTime": m["start_dt_str"], "timeZone": TIMEZONE},
-                    "end":   {"dateTime": m["end_dt_str"],   "timeZone": TIMEZONE},
-                }
-                service.events().patch(calendarId=CALENDAR_ID, eventId=event_id, body=patch_body).execute()
-                updated += 1
-                print(f"[UPDATED] {m['summary']} → {existing.get('htmlLink','')}")
-                continue
-
+        if has_duplicate_event(service, CALENDAR_ID, start_dt, m["summary"]):
+            continue
         event = {
             "summary": m["summary"],
             "description": f"Auto-added from {BO3_URL}\nMatch page: {m['link']}",
@@ -254,54 +201,7 @@ def create_events(service, matches):
         res = service.events().insert(calendarId=CALENDAR_ID, body=event).execute()
         print(f"[CREATED] {m['summary']} → {res.get('htmlLink','')}")
         created += 1
-    return created, updated
-
-def _calc_today_recheck(matches) -> Tuple[Optional[int], Optional[datetime]]:
-    now_local = datetime.now(TZ_LOCAL)
-    today = now_local.date()
-    grace = timedelta(minutes=PAST_GRACE_MINUTES)
-    relevant_starts = []
-
-    for m in matches:
-        try:
-            start_naive = datetime.strptime(m["start_dt_str"], "%Y-%m-%dT%H:%M:%S")
-            start_local = TZ_LOCAL.localize(start_naive)
-        except Exception as exc:
-            print(f"[WARN] Failed to parse match start '{m.get('start_dt_str')}' for today check: {exc}")
-            continue
-
-        if start_local.date() != today:
-            continue
-
-        if start_local < now_local - grace:
-            continue
-
-        relevant_starts.append(start_local)
-
-    if not relevant_starts:
-        return None, None
-
-    soonest_start = min(relevant_starts)
-    base_delay = max(1, TODAY_RECHECK_INTERVAL_SECONDS)
-
-    if soonest_start > now_local:
-        seconds_until_start = int((soonest_start - now_local).total_seconds())
-        base_delay = min(base_delay, max(1, seconds_until_start))
-
-    return base_delay, soonest_start
-
-def sync_matches(service):
-    print(f"[CHECK] Source: bo3.gg (Playwright); TZ={TIMEZONE}")
-    print(f"[CHECK] Filters: LOOKAHEAD_DAYS={LOOKAHEAD_DAYS}, PAST_GRACE_MINUTES={PAST_GRACE_MINUTES}")
-    matches = scrape_matches()
-    print(f"[INFO] Parsed matches after filtering: {len(matches)}")
-    if not matches:
-        print("[WARN] Nothing parsed (or everything filtered out).")
-        return matches
-
-    created, updated = create_events(service, matches)
-    print(f"[DONE] Created {created} events, updated {updated} events.")
-    return matches
+    return created
 
 def main():
     creds_json = os.environ.get("GOOGLE_CREDENTIALS_JSON")
@@ -311,29 +211,16 @@ def main():
     creds = Credentials.from_service_account_info(info, scopes=["https://www.googleapis.com/auth/calendar"])
     service = build("calendar", "v3", credentials=creds, cache_discovery=False)
 
-    iteration = 1
-    while True:
-        print(f"[RUN] Sync iteration {iteration}")
-        matches = sync_matches(service)
-        if not matches:
-            break
+    print(f"[CHECK] Source: bo3.gg (Playwright); TZ={TIMEZONE}")
+    print(f"[CHECK] Filters: LOOKAHEAD_DAYS={LOOKAHEAD_DAYS}, PAST_GRACE_MINUTES={PAST_GRACE_MINUTES}")
+    matches = scrape_matches()
+    print(f"[INFO] Parsed matches after filtering: {len(matches)}")
+    if not matches:
+        print("[WARN] Nothing parsed (or everything filtered out).")
+        return
 
-        recheck_delay, next_today_start = _calc_today_recheck(matches)
-        if recheck_delay is not None:
-            if next_today_start:
-                start_str = next_today_start.strftime("%H:%M")
-                print(
-                    f"[INFO] Match today (next at {start_str}). Sleeping {recheck_delay} seconds before re-check."
-                )
-            else:
-                print(
-                    f"[INFO] Match today. Sleeping {recheck_delay} seconds before re-check."
-                )
-            time.sleep(recheck_delay)
-            iteration += 1
-            continue
-
-        break
+    created = create_events(service, matches)
+    print(f"[DONE] Created {created} events.")
 
 if __name__ == "__main__":
     main()
